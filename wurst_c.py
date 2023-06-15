@@ -1,13 +1,16 @@
 """@xvdp
 rewrite of würstchen-stage-C.ipynb
 """
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 import time
 import os
 import os.path as osp
+from PIL import Image
 import matplotlib.pyplot as plt
 import torch
 from torch import Tensor, nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 
 import transformers
 from transformers.utils import is_torch_bf16_gpu_available as _bf16_gpu
@@ -300,3 +303,38 @@ def showimages(imgs: list, rows: bool = False, **kwargs) -> None:
     else:
         plt.imshow(_toimg(torch.cat([torch.cat([i for i in imgs], dim=-1)], dim=-2)))
     plt.show()
+
+
+
+class ImageDataset(Dataset):
+    """simple image dataset"""
+    def __init__(self, folder_path, transform=None):
+        self.folder_path = folder_path
+        self.image_list = os.listdir(folder_path)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        image_name = self.image_list[idx]
+        image_path = os.path.join(self.folder_path, image_name)
+        image = Image.open(image_path).convert("RGB")
+
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, image_name
+
+def get_dataset(path: str,
+                resize: Union[Tuple[int,int], int, None] = None) -> Dataset:
+    """simple image dataset instance"""
+    transform = [transforms.ToTensor()]
+    if resize is not None:
+        transform = [transforms.Resize(resize)] + transform
+    transform = transforms.Compose(transform)
+    
+    return ImageDataset(path, transform=transform)
+
+# Create a data loader to iterate through the dataset
+# batch_size = 4  # Define your desired batch size
+# dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
