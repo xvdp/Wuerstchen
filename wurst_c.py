@@ -1,5 +1,11 @@
 """@xvdp
 rewrite of würstchen-stage-C.ipynb
+
+Fixes. 
+Added kwargs
+        compile_models (bool [True]) - optional, do not compile
+        tockenizers_parallelism (bool [False])  - fixes an error with compilation and multiprocessing
+ 
 """
 from typing import Optional, Tuple, List, Union
 import time
@@ -9,7 +15,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import torch
 from torch import Tensor, nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torchvision import transforms
 
 import transformers
@@ -22,7 +28,7 @@ from modules import Paella, EfficientNetEncoder, Prior
 from diffuzz import Diffuzz
 
 transformers.utils.logging.set_verbosity_error()
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 
 # pylint: disable=no-member
 class Wurst:
@@ -31,7 +37,10 @@ class Wurst:
     kwargs
         device      (str) [cuda:0 if available]
         cache_dir   (str) ['~/.cache'] to prevent redownload with docker and share volumes
-        weights_dir (str) ['models'] defaults to local dir  
+        weights_dir (str) ['models'] defaults to local dir
+
+        compile_models (bool [True])
+        tockenizers_parallelism (bool [False])
     """
     def __init__(self, **kwargs):
         self.set_cache_paths(kwargs.get('cache_dir', None))
@@ -53,14 +62,41 @@ class Wurst:
         self.vqmodel = None
         self.clip_tokenizer = None
         self.effnet = None
-        self.help
+
+        # for debugging compile and parallelism
+        self.compile_models = kwargs.get('compile_models', True)
+        self.unset_parallism(kwargs.get('tockenizers_parallelism', False))
+        self.eval_time = None
+
 
     @property
     def help(self):
-        print('usage:\n\tdownload models from  https://huggingface.co/dome272/wuerstchen and place under "models/"')
+        print('usage: download models from  https://huggingface.co/dome272/wuerstchen and place under "models/"')
         print('    W = Wurst([cache_dir="~/.cache", weights_dir="./models", device="cuda:0"])')
-        print('    W.load_models()\n    W.infer(caption=<>, negative_caption=<>, batch_size=<>)')
+        print('    W.load_models()\n    samples=W.infer(caption=<>, negative_caption=<>, batch_size=<>)')
         print('to cache torch and huggingface models other than "~/.cache" init with Wurst(cache_dir=)')
+
+
+    @staticmethod
+    def unset_parallism(parallel):
+        """ over docker version 24.0.2
+        """
+        if parallel is None:
+            if os.getenv('TOKENIZERS_PARALLELISM'):
+                os.environ.pop('TOKENIZERS_PARALLELISM')
+        elif not parallel:
+            os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+        else:
+            os.environ['TOKENIZERS_PARALLELISM']= 'true'
+
+
+    def compile(self):
+        if torch.__version__ >= '2.0':
+            torch.compile(self.model, mode="reduce-overhead", fullgraph=True)
+            torch.compile(self.generator, mode="reduce-overhead", fullgraph=True)
+        else:
+            print(f"torch.__version__ >= 2.0 required for compile got {torch.__version__}")
+
 
     def load_models(self) -> None:
         """
@@ -74,37 +110,45 @@ class Wurst:
                     clip_tokenizer: AutoTokenizer
                     vqmodel:        VQModel
         """
-        print("loading Difuzz")
+        _time_start = time.time()
+        print("  loading Difuzz")
         self.diffuzz = Diffuzz(device=self.device)
 
         _stage_c = osp.join(self.weights,"model_stage_c_ema.pt")
-        print(f"loading Prior from {_stage_c}")
+        print(f"  loading Prior from {_stage_c}")
         self.model = Prior(c_in=16, c=1536, c_cond=1024, c_r=64, depth=32, nhead=24) # 993,243,680
         self.model.load_state_dict(torch.load(_stage_c)['ema_state_dict'])
         self.model.eval().requires_grad_(False).to(device=self.device)
 
-        _stage_b = torch.load(osp.join(self.weights, "model_stage_b.pt"))
-        print(f"loading EfficientNetEncoder from {_stage_b}")
+        _stage_b = osp.join(self.weights, "model_stage_b.pt")
+        _stage_b_cpk = torch.load(_stage_b)
+        print(f"  loading EfficientNetEncoder from {_stage_b}")
         self.effnet = EfficientNetEncoder(effnet="efficientnet_v2_l")   # 117,254,784
-        self.effnet.load_state_dict(_stage_b['effnet_state_dict'])
+        self.effnet.load_state_dict(_stage_b_cpk['effnet_state_dict'])
         self.effnet.eval().requires_grad_(False).to(device=self.device)
 
-        print(f"loading Paella from {_stage_b}")
+        print(f"  loading Paella from {_stage_b}")
         self.generator = Paella(byt5_embd=1024)                         # 730,814,336
-        self.generator.load_state_dict(_stage_b['state_dict'])
+        self.generator.load_state_dict(_stage_b_cpk['state_dict'])
         self.generator.eval().requires_grad_(False).to(device=self.device)
 
         _clipvit = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
-        print(f"loading CLIPTextModel from {_clipvit}")
+        print(f"  loading CLIPTextModel from {_clipvit}")
         self.clip_model = CLIPTextModel.from_pretrained(_clipvit)   # 352,984,064
         self.clip_model.eval().requires_grad_(False).to(device=self.device)
         self.clip_tokenizer = AutoTokenizer.from_pretrained(_clipvit)
 
         _vq = osp.join(self.weights,"vqgan_f4_v1_500k.pt")
-        print(f"loading VQModel from {_vq}")
+        print(f"  loading VQModel from {_vq}")
         self.vqmodel = VQModel()                            # 18,406,894
         self.vqmodel.load_state_dict(torch.load(_vq)["state_dict"])
         self.vqmodel.eval().requires_grad_(False).to(device=self.device)
+
+        if self.compile_models:
+            s = time.time()
+            self.compile()
+            print(f" Compilation Time: {time.time() - s:.3f} s")
+        print(f" Total Load Time: {time.time() - _time_start:.3f} s")
 
 
     def unload(self) -> None:
@@ -152,6 +196,7 @@ class Wurst:
               show: bool = True) -> Tensor:
         """ runs inference on caption
         """
+        print(f"Infer {batch_size} with caption {caption}")
 
         clip_text_embed, clip_text_embed_uncond = self.embed_clip(caption, negative_caption,
                                                                   batch_size)
@@ -163,36 +208,37 @@ class Wurst:
             torch.manual_seed(seed)
 
         with torch.cuda.amp.autocast(dtype=self.float16), torch.no_grad():
-            s = time.time()
+            _time_start = time.time()
+            _time_now = _time_start
             sampled = self.diffuzz.sample(self.model, {'c': clip_text_embed},
                                           unconditional_inputs={"c": clip_text_embed_uncond},
                                           shape=effnet_features_shape, timesteps=prior_timesteps,
                                           cfg=prior_cfg, sampler=prior_sampler, t_start=1.0)[-1]
-            print(f"Prior Sampling:    {time.time() - s:.3f} s")
+            print(f" Prior Sampling:    {time.time() - _time_now:.3f} s")
             temperature, cfg, steps =(1.0, 0.6), (2.0, 2.0), 8
-            s = time.time()
-            orig, inter = self.sample(self.generator,
-                                      model_inputs={'effnet': sampled,'byt5': clip_text_embed},
+            _time_now = time.time()
+            orig, inter = self.sample(model_inputs={'effnet': sampled,'byt5': clip_text_embed},
                                       latent_shape=generator_latent_shape,
                                       unconditional_inputs = {'effnet': effnet_embeddings_uncond,
                                                               'byt5': clip_text_embed_uncond},
                                       temperature=temperature, cfg=cfg, steps=steps
             )
-            print(f"Generator Sampling: {time.time() - s:.3f} s")
+            print(f" Generator Sampling: {time.time() - _time_now:.3f} s")
 
-        s = time.time()
+        _time_now = time.time()
         sampled = torch.clamp(self.decode(orig), 0, 1).cpu()
-        print(f"Decoder Generation: {time.time() - s:.3f} s")
+        print(f" Decoder Generation: {time.time() - _time_now:.3f} s")
         # inter = [decode(i) for i in inter]
-        print(f"Temperature: {temperature}, CFG: {cfg}, Steps: {steps}")
-
+        print(f"   Temperature: {temperature}, CFG: {cfg}, Steps: {steps}")
+        torch.cuda.synchronize()
+        self.eval_time = time.time() - _time_start
+        print(f" Total Infrence Time: {self.eval_time:.3f} s")
         if show:
             showimages(sampled, title=caption)
         return sampled
 
 
     def sample(self,
-               model: nn.Module,
                model_inputs: dict,
                latent_shape: tuple,
                unconditional_inputs: Optional[dict] = None,
@@ -209,7 +255,6 @@ class Wurst:
                ) -> Tuple[Tensor, List[Tensor]]:
         """
         Args
-            model       (nn.Module) generator model
             mode        (str ['multinomial']), # 'quant', 'multinomial', 'argmax'
         """
         assert mode in ('quant', 'multinomial', 'argmax'), \
@@ -226,7 +271,7 @@ class Wurst:
             intermediate_images = []
 
 
-            init_noise = torch.randint(0, model.num_labels, size=latent_shape, device=device)
+            init_noise = torch.randint(0, self.generator.num_labels, size=latent_shape, device=device)
             sampled = init_x or init_noise.clone()
 
             t_list = torch.linspace(t_start, t_end, steps+1)
@@ -242,11 +287,11 @@ class Wurst:
                 t = torch.ones(latent_shape[0], device=device) * tv
 
                 if cfg is not None and i < sampling_conditional_steps:
-                    logits, uncond_logits = model(torch.cat([sampled]*2), torch.cat([t]*2),
+                    logits, uncond_logits = self.generator(torch.cat([sampled]*2), torch.cat([t]*2),
                                                   **model_inputs).chunk(2)
                     logits = logits * cfgs[i] + uncond_logits * (1-cfgs[i])
                 else:
-                    logits = model(sampled, t, **model_inputs)
+                    logits = self.generator(sampled, t, **model_inputs)
 
                 scores = logits.div(temperatures[i]).softmax(dim=1)
 
@@ -264,7 +309,7 @@ class Wurst:
 
                 if i < renoise_steps:
                     t_next = torch.ones(latent_shape[0], device=device) * t_list[i+1]
-                    sampled = model.add_noise(sampled, t_next, random_x=init_noise)[0]
+                    sampled = self.generator.add_noise(sampled, t_next, random_x=init_noise)[0]
                     intermediate_images.append(sampled)
         return sampled, intermediate_images
 
