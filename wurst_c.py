@@ -92,8 +92,8 @@ class Wurst:
 
     def compile(self):
         if torch.__version__ >= '2.0':
-            torch.compile(self.model, mode="reduce-overhead", fullgraph=True)
-            torch.compile(self.generator, mode="reduce-overhead", fullgraph=True)
+            self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=True)
+            self.generator = torch.compile(self.generator, mode="reduce-overhead", fullgraph=True)
         else:
             print(f"torch.__version__ >= 2.0 required for compile got {torch.__version__}")
 
